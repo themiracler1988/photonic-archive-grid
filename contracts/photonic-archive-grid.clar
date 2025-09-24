@@ -340,3 +340,202 @@
   true
 )
 
+
+;; Emergency containment records mapping
+(define-map emergency-containments
+  { entry-id: uint, containment-block: uint }
+  {
+    threat-level: uint,
+    containment-reason: (string-ascii 128),
+    emergency-code: (string-ascii 16),
+    containment-action: (string-ascii 32),
+    administrator-address: principal,
+    affected-operator: principal,
+    containment-status: (string-ascii 16)
+  }
+)
+
+;; Implements comprehensive validation gate for entry operations with security scoring
+(define-public (validate-entry-security-score 
+  (entry-id uint)
+  (validation-metrics (list 5 uint))
+)
+  (let
+    (
+      (entry-data (unwrap! (map-get? quantum-registry { entry-id: entry-id }) ERROR_ENTRY_NOT_FOUND))
+      (metrics-count (len validation-metrics))
+      (operator-address (get operator-address entry-data))
+      (entry-age (- block-height (get block-timestamp entry-data)))
+    )
+    ;; Validate security metrics input
+    (asserts! (entry-exists? entry-id) ERROR_ENTRY_NOT_FOUND)
+    (asserts! (> metrics-count u0) ERROR_INVALID_PARAMETER_SIZE)
+    (asserts! (<= metrics-count u5) ERROR_INVALID_PARAMETER_SIZE)
+    (asserts! (or 
+      (is-eq operator-address tx-sender)
+      (is-eq nexus-administrator tx-sender)
+    ) ERROR_ACCESS_DENIED)
+
+    ;; Calculate security score based on multiple factors
+    (let
+      (
+        (base-score (fold + validation-metrics u0))
+        (age-penalty (if (> entry-age u1000) u10 u0))
+        (weight-bonus (if (> (get data-weight entry-data) u1000) u5 u0))
+        (tag-bonus (if (> (len (get classification-tags entry-data)) u3) u3 u0))
+        (final-score (- (+ base-score weight-bonus tag-bonus) age-penalty))
+      )
+      ;; Ensure minimum security threshold
+      (asserts! (>= final-score u10) ERROR_INVALID_QUANTUM_VALUE)
+
+      ;; Update security validation timestamp
+      (map-set security-validations
+        { entry-id: entry-id }
+        {
+          last-validation: block-height,
+          validator-address: tx-sender,
+          security-score: final-score,
+          validation-status: true
+        }
+      )
+
+      (ok {
+        security-score: final-score,
+        validation-passed: true,
+        validation-block: block-height,
+        next-validation-due: (+ block-height u2000)
+      })
+    )
+  )
+)
+
+;; Security validation tracking map
+(define-map security-validations
+  { entry-id: uint }
+  {
+    last-validation: uint,
+    validator-address: principal,
+    security-score: uint,
+    validation-status: bool
+  }
+)
+
+;; Manages permissions for multiple entries in a single secure transaction
+(define-public (batch-manage-permissions 
+  (entry-ids (list 20 uint)) 
+  (accessor-addresses (list 20 principal)) 
+  (grant-permissions (list 20 bool))
+)
+  (let
+    (
+      (entries-count (len entry-ids))
+      (addresses-count (len accessor-addresses))
+      (permissions-count (len grant-permissions))
+    )
+    ;; Validate input array lengths match
+    (asserts! (> entries-count u0) ERROR_INVALID_PARAMETER_SIZE)
+    (asserts! (<= entries-count u20) ERROR_INVALID_PARAMETER_SIZE)
+    (asserts! (is-eq entries-count addresses-count) ERROR_INVALID_PARAMETER_SIZE)
+    (asserts! (is-eq entries-count permissions-count) ERROR_INVALID_PARAMETER_SIZE)
+
+    ;; Process batch permission updates
+    (ok (map process-single-permission-update 
+      entry-ids 
+      accessor-addresses 
+      grant-permissions
+    ))
+  )
+)
+
+;; Helper function to process individual permission updates
+(define-private (process-single-permission-update 
+  (entry-id uint) 
+  (accessor-address principal) 
+  (grant-access bool)
+)
+  (let
+    (
+      (entry-data (unwrap! (map-get? quantum-registry { entry-id: entry-id }) false))
+    )
+    ;; Verify operator ownership before permission change
+    (if (and 
+          (entry-exists? entry-id)
+          (is-eq (get operator-address entry-data) tx-sender)
+        )
+      (begin
+        (if grant-access
+          (map-set access-permissions
+            { entry-id: entry-id, accessor-address: accessor-address }
+            { permission-granted: true }
+          )
+          (map-set access-permissions
+            { entry-id: entry-id, accessor-address: accessor-address }
+            { permission-granted: false }
+          )
+        )
+        true
+      )
+      false
+    )
+  )
+)
+
+;; Verifies data integrity and detects tampering attempts on registry entries
+(define-public (verify-entry-integrity (entry-id uint) (expected-signature (string-ascii 128)))
+  (let
+    (
+      (entry-data (unwrap! (map-get? quantum-registry { entry-id: entry-id }) ERROR_ENTRY_NOT_FOUND))
+      (current-signature (get content-signature entry-data))
+      (current-weight (get data-weight entry-data))
+      (current-timestamp (get block-timestamp entry-data))
+    )
+    ;; Validate entry exists and signature format
+    (asserts! (entry-exists? entry-id) ERROR_ENTRY_NOT_FOUND)
+    (asserts! (> (len expected-signature) u0) ERROR_INVALID_PARAMETER_SIZE)
+    (asserts! (< (len expected-signature) u129) ERROR_INVALID_PARAMETER_SIZE)
+
+    ;; Verify signature matches
+    (asserts! (is-eq current-signature expected-signature) ERROR_INVALID_PARAMETER_SIZE)
+
+    ;; Additional integrity checks
+    (asserts! (> current-weight u0) ERROR_INVALID_QUANTUM_VALUE)
+    (asserts! (> current-timestamp u0) ERROR_INVALID_QUANTUM_VALUE)
+    (asserts! (<= current-timestamp block-height) ERROR_INVALID_QUANTUM_VALUE)
+
+    ;; Return integrity status with metadata
+    (ok {
+      verified: true,
+      entry-weight: current-weight,
+      verification-block: block-height,
+      signature-match: true
+    })
+  )
+)
+
+;; Validates and enforces multi-level access control for registry entries
+(define-public (validate-entry-access (entry-id uint) (accessor-address principal) (access-level uint))
+  (let
+    (
+      (entry-data (unwrap! (map-get? quantum-registry { entry-id: entry-id }) ERROR_ENTRY_NOT_FOUND))
+      (permission-data (map-get? access-permissions { entry-id: entry-id, accessor-address: accessor-address }))
+    )
+    ;; Validate entry exists and access parameters
+    (asserts! (entry-exists? entry-id) ERROR_ENTRY_NOT_FOUND)
+    (asserts! (> access-level u0) ERROR_INVALID_QUANTUM_VALUE)
+    (asserts! (<= access-level u5) ERROR_INVALID_QUANTUM_VALUE)
+
+    ;; Check if accessor is the operator (highest access level)
+    (if (is-eq (get operator-address entry-data) accessor-address)
+      (ok u5)
+      ;; Check explicit permissions for non-operators
+      (match permission-data
+        permission-record
+          (if (get permission-granted permission-record)
+            (ok u3)
+            ERROR_PERMISSION_DENIED
+          )
+        ERROR_PERMISSION_DENIED
+      )
+    )
+  )
+)
